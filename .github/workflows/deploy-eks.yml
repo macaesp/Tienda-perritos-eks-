@@ -6,19 +6,22 @@ on:
   workflow_dispatch: {}
 
 env:
-  # Repos de ECR (no son secretos, solo nombres)
+  # Repositorios de ECR (nombres de las imágenes)
   ECR_REPO_FRONTEND: tienda-frontend
   ECR_REPO_BACKEND: tienda-backend
   ECR_REPO_DB: tienda-db
 
 jobs:
   build-and-deploy:
+    name: Build & Deploy to Amazon EKS
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Descargar el código del repositorio
       - name: Checkout código
         uses: actions/checkout@v4
 
+      # 2. Configurar credenciales de AWS de forma segura
       - name: Configurar credenciales AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -27,68 +30,94 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
 
+      # 3. Autenticarse en Amazon ECR
       - name: Login a Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # 4. Generar un Tag único usando el SHA corto de Git
       - name: Definir tag de imagen
         run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
 
-      # ---------- FRONTEND ----------
+      # ==========================================
+      # ETAPA DE COMPILACIÓN (BUILD & PUSH)
+      # ==========================================
+
       - name: Build & push FRONTEND
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          cd frontend
-          docker build -t $ECR_REGISTRY/${ECR_REPO_FRONTEND}:${IMAGE_TAG} .
+          docker build -t $ECR_REGISTRY/${ECR_REPO_FRONTEND}:${IMAGE_TAG} ./frontend
           docker push $ECR_REGISTRY/${ECR_REPO_FRONTEND}:${IMAGE_TAG}
 
-      # ---------- BACKEND ----------
       - name: Build & push BACKEND
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          cd backend
-          docker build -t $ECR_REGISTRY/${ECR_REPO_BACKEND}:${IMAGE_TAG} .
+          docker build -t $ECR_REGISTRY/${ECR_REPO_BACKEND}:${IMAGE_TAG} ./backend
           docker push $ECR_REGISTRY/${ECR_REPO_BACKEND}:${IMAGE_TAG}
 
-      # ---------- DB (opcional) ----------
-      - name: Build & push DB
+      - name: Build & push DB (Opcional)
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          cd db
-          docker build -t $ECR_REGISTRY/${ECR_REPO_DB}:${IMAGE_TAG} .
-          docker push $ECR_REGISTRY/${ECR_REPO_DB}:${IMAGE_TAG}
+          if [ -d "./db" ]; then
+            docker build -t $ECR_REGISTRY/${ECR_REPO_DB}:${IMAGE_TAG} ./db
+            docker push $ECR_REGISTRY/${ECR_REPO_DB}:${IMAGE_TAG}
+          else
+            echo "Directorio ./db no encontrado, saltando compilación de DB."
+          fi
 
-      # ---------- Instalar kubectl ----------
+      # ==========================================
+      # ETAPA DE PREPARACIÓN DE KUBERNETES
+      # ==========================================
+
       - name: Instalar kubectl
         uses: azure/setup-kubectl@v4
         with:
           version: v1.29.0
 
-      # ---------- Configurar kubeconfig de EKS ----------
       - name: Configurar kubeconfig para EKS
         env:
           AWS_REGION: ${{ secrets.AWS_REGION }}
           EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
         run: |
-          aws eks update-kubeconfig \
-            --region $AWS_REGION \
-            --name $EKS_CLUSTER_NAME
+          aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
           kubectl config current-context
 
-      # ---------- Aplicar manifests base ----------
-      - name: Aplicar manifests base (namespace, DB, servicios)
+      # ==========================================
+      # ETAPA DE DESPLIEGUE (DEPLOY)
+      # ==========================================
+
+      # Solución al error de namespace.yaml: Si el archivo no existe, lo creamos dinámicamente.
+      - name: Asegurar existencia del Namespace
         env:
           EKS_NAMESPACE: ${{ secrets.EKS_NAMESPACE }}
         run: |
-          kubectl apply -f k8s/namespace.yaml
-          kubectl apply -f k8s/mysql-secret.yaml -n $EKS_NAMESPACE
-          kubectl apply -f k8s/mysql-deployment.yaml -n $EKS_NAMESPACE
-          kubectl apply -f k8s/mysql-service.yaml -n $EKS_NAMESPACE
+          if [ -f k8s/namespace.yaml ]; then
+            kubectl apply -f k8s/namespace.yaml
+          else
+            echo "k8s/namespace.yaml no encontrado. Creando namespace '$EKS_NAMESPACE' de forma dinámica..."
+            kubectl create namespace $EKS_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+          fi
 
-      # ---------- Actualizar BACKEND en EKS ----------
+      - name: Aplicar manifiestos base de Base de Datos
+        env:
+          EKS_NAMESPACE: ${{ secrets.EKS_NAMESPACE }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          # Aplicamos configuraciones base de la DB
+          if [ -f k8s/mysql-secret.yaml ]; then kubectl apply -f k8s/mysql-secret.yaml -n $EKS_NAMESPACE; fi
+          if [ -f k8s/mysql-service.yaml ]; then kubectl apply -f k8s/mysql-service.yaml -n $EKS_NAMESPACE; fi
+          if [ -f k8s/mysql-deployment.yaml ]; then 
+            kubectl apply -f k8s/mysql-deployment.yaml -n $EKS_NAMESPACE
+            
+            # ¡NUEVO! Si compilamos una imagen DB personalizada, la actualizamos en Kubernetes
+            if [ -d "./db" ]; then
+              kubectl set image deployment/tienda-db mysql=$ECR_REGISTRY/${ECR_REPO_DB}:${IMAGE_TAG} -n $EKS_NAMESPACE --record || true
+            fi
+          fi
+
       - name: Actualizar BACKEND en EKS
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -96,12 +125,9 @@ jobs:
         run: |
           kubectl apply -f k8s/backend-deployment.yaml -n $EKS_NAMESPACE
           kubectl apply -f k8s/backend-service.yaml -n $EKS_NAMESPACE
-          kubectl set image deployment/tienda-backend \
-            backend=$ECR_REGISTRY/${ECR_REPO_BACKEND}:${IMAGE_TAG} \
-            -n $EKS_NAMESPACE
-          kubectl rollout status deployment/tienda-backend -n $EKS_NAMESPACE
+          kubectl set image deployment/tienda-backend backend=$ECR_REGISTRY/${ECR_REPO_BACKEND}:${IMAGE_TAG} -n $EKS_NAMESPACE
+          kubectl rollout status deployment/tienda-backend -n $EKS_NAMESPACE --timeout=120s
 
-      # ---------- Actualizar FRONTEND en EKS ----------
       - name: Actualizar FRONTEND en EKS
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -109,24 +135,27 @@ jobs:
         run: |
           kubectl apply -f k8s/frontend-deployment.yaml -n $EKS_NAMESPACE
           kubectl apply -f k8s/frontend-service.yaml -n $EKS_NAMESPACE
-          kubectl set image deployment/tienda-frontend \
-            frontend=$ECR_REGISTRY/${ECR_REPO_FRONTEND}:${IMAGE_TAG} \
-            -n $EKS_NAMESPACE
-          kubectl rollout status deployment/tienda-frontend -n $EKS_NAMESPACE
+          kubectl set image deployment/tienda-frontend frontend=$ECR_REGISTRY/${ECR_REPO_FRONTEND}:${IMAGE_TAG} -n $EKS_NAMESPACE
+          kubectl rollout status deployment/tienda-frontend -n $EKS_NAMESPACE --timeout=120s
 
-      # ---------- HPA (si existen los YAML) ----------
-      - name: Aplicar HPA (opcional)
+      - name: Aplicar HPA (Opcional)
         env:
           EKS_NAMESPACE: ${{ secrets.EKS_NAMESPACE }}
         run: |
           if [ -f k8s/backend-hpa.yaml ]; then kubectl apply -f k8s/backend-hpa.yaml -n $EKS_NAMESPACE; fi
           if [ -f k8s/frontend-hpa.yaml ]; then kubectl apply -f k8s/frontend-hpa.yaml -n $EKS_NAMESPACE; fi
 
-      # ---------- Ver estado final ----------
-      - name: Ver pods y servicios
+      # ==========================================
+      # AUDITORÍA / ESTADO FINAL
+      # ==========================================
+
+      - name: Ver estado de los recursos
         env:
           EKS_NAMESPACE: ${{ secrets.EKS_NAMESPACE }}
         run: |
+          echo "=== PODS EN EL NAMESPACE $EKS_NAMESPACE ==="
           kubectl get pods -n $EKS_NAMESPACE
+          echo "=== SERVICIOS EN EL NAMESPACE $EKS_NAMESPACE ==="
           kubectl get svc -n $EKS_NAMESPACE
-          kubectl get hpa -n $EKS_NAMESPACE || true
+          echo "=== AUTOSCALERS ==="
+          kubectl get hpa -n $EKS_NAMESPACE || echo "No HPAs encontrados"
