@@ -32,6 +32,13 @@ spec:
               value: "tienda_perritos"
             - name: DB_PORT
               value: "3306"
+            # ==========================================
+            # DESACTIVAR TELEMETRÍA (SOLUCIÓN ERROR 504)
+            # ==========================================
+            - name: OTEL_TRACES_EXPORTER
+              value: "none"
+            - name: OTEL_METRICS_EXPORTER
+              value: "none"
 
           # Se agrega Resource para que Metrics Server calcule el % de CPU y Memoria para escalar 
           resources:
