@@ -5,7 +5,8 @@
 // Determinar la URL base de la API según el host
 // frontend/app.js
 
-const API_BASE = "http://a91bb2252c269471ca0488f121579142-1569537220.us-east-1.elb.amazonaws.com:3001/api/productos";
+const API_BASE = "http://a91bb2252c269471ca0488f121579142-7bac6b83ac8b0a64.elb.us-east-1.amazonaws.com:3001/api/productos";
+
 let editandoId = null;
 
 const tbody = document.getElementById("tbodyProductos");
